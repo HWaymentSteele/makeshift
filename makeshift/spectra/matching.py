@@ -15,10 +15,12 @@ def _match_hungarian(df, ref_df, tol_h=0.03, tol_n=0.3, h_col="H_ppm", n_col="N_
     Match peaks between two DataFrames using the Hungarian algorithm.
 
     Each peak in ref_df is matched to at most one peak in df within
-    (tol_h, tol_n) ppm tolerance.
+    (tol_h, tol_n) ppm tolerance, i.e. tol-normalized elliptical distance
+    sqrt((dH/tol_h)^2 + (dN/tol_n)^2) < 1.
 
     Returns a DataFrame aligned to ref_df with added columns: ref_index,
-    matched, dist_h, dist_n.
+    matched, dist_h, dist_n, tgt_index (row position in df, NaN if
+    unmatched).
     """
     ref = ref_df.reset_index(drop=True)
     tgt = df.reset_index(drop=True)
@@ -39,7 +41,10 @@ def _match_hungarian(df, ref_df, tol_h=0.03, tol_n=0.3, h_col="H_ppm", n_col="N_
     UNMATCHED_COST = 1.0
     BIG = 1e6
     cost = np.full((n, n), BIG)
-    cost[:n_ref, :n_tgt] = dist
+    # Hard cutoff: pairs outside the tolerance ellipse are forbidden.
+    # Without this, a pair costing `dist` competes against leaving both
+    # peaks unmatched (2 * UNMATCHED_COST), so matches up to dist ~2 slip in.
+    cost[:n_ref, :n_tgt] = np.where(dist < 1.0, dist, BIG)
     cost[:n_ref, n_tgt:] = np.eye(n_ref) * UNMATCHED_COST + (1 - np.eye(n_ref)) * BIG
     cost[n_ref:, :n_tgt] = np.eye(n_tgt) * UNMATCHED_COST + (1 - np.eye(n_tgt)) * BIG
     cost[n_ref:, n_tgt:] = 0.0
@@ -47,7 +52,7 @@ def _match_hungarian(df, ref_df, tol_h=0.03, tol_n=0.3, h_col="H_ppm", n_col="N_
     ref_pos, tgt_pos = linear_sum_assignment(cost)
     matches = {}
     for rp, tp in zip(ref_pos, tgt_pos):
-        if rp < n_ref and tp < n_tgt:
+        if rp < n_ref and tp < n_tgt and dist[rp, tp] < 1.0:
             matches[rp] = tp
 
     rows = []
@@ -58,12 +63,66 @@ def _match_hungarian(df, ref_df, tol_h=0.03, tol_n=0.3, h_col="H_ppm", n_col="N_
             row = tgt.iloc[j].to_dict()
             row.update(ref_index=i, matched=True,
                        dist_h=float(tgt.iloc[j][h_col] - rh_val),
-                       dist_n=float(tgt.iloc[j][n_col] - rn_val))
+                       dist_n=float(tgt.iloc[j][n_col] - rn_val),
+                       tgt_index=j)
         else:
             row = {col: np.nan for col in tgt.columns}
-            row.update(ref_index=i, matched=False, dist_h=np.nan, dist_n=np.nan)
+            row.update(ref_index=i, matched=False, dist_h=np.nan, dist_n=np.nan,
+                       tgt_index=np.nan)
         rows.append(row)
     return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def _match_unique_round2(right_mapped, left, matched, tol2, h_col="H_ppm", n_col="N_ppm"):
+    """
+    Second matching round at a wider tolerance, restricted to unambiguous
+    leftovers.
+
+    A left peak L and right peak R that were both unmatched in round 1 are
+    paired only if, within the (tol2_h, tol2_n) ellipse, L is the *only*
+    left peak near R and R is the *only* right peak near L. Peaks already
+    matched in round 1 count as nearby candidates, so anything sitting near
+    an existing assignment stays unassigned.
+
+    Returns (matched, n_round2), with `matched` updated in place of the
+    round-2 rows and a `match_round` column (1, 2, or NaN).
+    """
+    tol2_h, tol2_n = tol2
+    left = left.reset_index(drop=True)
+    right = right_mapped.reset_index(drop=True)
+
+    matched = matched.copy()
+    matched['match_round'] = np.where(matched['matched'], 1.0, np.nan)
+
+    dh = (left[h_col].to_numpy()[:, None] - right[h_col].to_numpy()[None, :]) / tol2_h
+    dn = (left[n_col].to_numpy()[:, None] - right[n_col].to_numpy()[None, :]) / tol2_n
+    near = np.sqrt(dh**2 + dn**2) < 1.0          # (n_left, n_right)
+
+    left_free = ~matched['matched'].to_numpy(dtype=bool)
+    right_free = np.ones(len(right), dtype=bool)
+    right_free[matched.loc[matched['matched'], 'tgt_index'].astype(int).to_numpy()] = False
+
+    n_near_left = near.sum(axis=1)   # right peaks near each left peak
+    n_near_right = near.sum(axis=0)  # left peaks near each right peak
+
+    pairs = []
+    for j in np.flatnonzero(right_free & (n_near_right == 1)):
+        i = int(np.flatnonzero(near[:, j])[0])
+        if left_free[i] and n_near_left[i] == 1:
+            pairs.append((i, int(j)))
+
+    if not pairs:
+        return matched, 0
+
+    rows = matched.to_dict('records')
+    for i, j in pairs:
+        row = rows[i]
+        row.update(right.iloc[j].to_dict())
+        row.update(ref_index=i, matched=True,
+                   dist_h=float(right.iloc[j][h_col] - left.iloc[i][h_col]),
+                   dist_n=float(right.iloc[j][n_col] - left.iloc[i][n_col]),
+                   tgt_index=j, match_round=2.0)
+    return pd.DataFrame(rows, columns=matched.columns), len(pairs)
 
 
 def _find_offset(left, right, tol):
@@ -164,6 +223,7 @@ def _apply_how(left, right_mapped, matched, how, right_label, tmp_label):
     if right_label is not None:
         out[right_label] = matched[tmp_label].values
     out['conflict'] = matched['conflict'].values
+    out['match_round'] = matched['match_round'].values
 
     if how in ("inner", "right"):
         out = out[matched['matched'].values].reset_index(drop=True)
@@ -179,6 +239,7 @@ def _apply_how(left, right_mapped, matched, how, right_label, tmp_label):
             if right_label is not None:
                 extra[right_label] = leftover[tmp_label].values
             extra['conflict'] = False
+            extra['match_round'] = np.nan
             out = pd.concat([out, extra], ignore_index=True)
 
     if how in ("inner", "right"):
@@ -188,17 +249,18 @@ def _apply_how(left, right_mapped, matched, how, right_label, tmp_label):
 
 
 def map_peaklists(left, right, offset=None,
-                  tol=1, label_cols=("assn_label", "assn_label"),
+                  tol=1, tol2="auto", label_cols=("assn_label", "assn_label"),
                   how="inner"):
     """
     Align two peak lists in (H_ppm, N_ppm) and match them one-to-one.
 
-    Align two peak lists in (H_ppm, N_ppm) and match them one-to-one.
-
     `right` (e.g. a reference assignment list) is shifted by a translation
     offset — grid-searched if `offset` is None — then Hungarian-matched to
-    `left` (treated as fixed) within tolerance. Right-side peaks that lost a
-    close match to a competitor are flagged in a `conflict` column.
+    `left` (treated as fixed) within tolerance. A second round at the wider
+    `tol2` then pairs leftover peaks that are each other's only candidate
+    within `tol2` (peaks matched in round 1 count as candidates). Right-side
+    peaks that lost a close match to a competitor are flagged in a
+    `conflict` column.
 
     Parameters
     ----------
@@ -209,6 +271,9 @@ def map_peaklists(left, right, offset=None,
         (Δ¹H, Δ¹⁵N) applied to `right`; grid-searched if None.
     tol : float
         Multiplier on the default matching tolerances (0.03, 0.3) ppm.
+    tol2 : float, "auto", or None
+        Multiplier on the default tolerances for the second, unambiguous-
+        leftovers round. "auto" uses 2 * tol; None skips round 2.
     label_cols : (str, str)
         Label columns on (left, right); either may be None.
     how : {"inner", "left", "right", "outer"}
@@ -217,7 +282,8 @@ def map_peaklists(left, right, offset=None,
     Returns
     -------
     left_out : DataFrame
-        Matched peaks with the right label + `conflict`, filtered per `how`.
+        Matched peaks with the right label, `conflict`, and `match_round`
+        (1 or 2; NaN if unmatched), filtered per `how`.
     right_mapped : DataFrame
         Full right peaklist after the offset (for plotting).
     """
@@ -246,7 +312,18 @@ def map_peaklists(left, right, offset=None,
                                tol_h=tol_h, tol_n=tol_n,
                                h_col='H_ppm', n_col='N_ppm')
 
-    #  conflict detection 
+    #  round 2: unambiguous leftovers at wider tolerance
+    if tol2 == "auto":
+        tol2 = 2 * tol
+    if tol2 is not None:
+        matched, n_round2 = _match_unique_round2(
+            right_mapped, left, matched, (0.03 * tol2, 0.3 * tol2),
+            h_col='H_ppm', n_col='N_ppm')
+        print(f'  Round 2 (tol x{tol2:g}): {n_round2} unambiguous leftover peak(s) assigned')
+    else:
+        matched['match_round'] = np.where(matched['matched'], 1.0, np.nan)
+
+    #  conflict detection
     matched = _detect_conflicts(right_mapped, left, matched, (tol_h, tol_n), tmp_label)
 
     #  build updated left 
